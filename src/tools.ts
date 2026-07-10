@@ -1,0 +1,896 @@
+/**
+ * MCP tool definitions for OVERDARE Studio.
+ *
+ * Each tool maps to a Studio RPC method (see rpcClient.ts). Schemas reflect the
+ * methods VERIFIED against a live Studio build:
+ *   working : level.browse, level.apply, level.save.file, level.publish,
+ *             game.play/stop/screenshot, script.add, instance.delete
+ *   absent  : instance.read/upsert/move, script.read/edit/grep (server returns
+ *             -32002 on this build) — reachable later via the .ovdrjm edit path.
+ *
+ * The model drives Studio by GUID: call overdare_browse first to learn the
+ * tree, then act on nodes by their `guid`.
+ */
+
+import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { StudioRpcClient } from "./rpcClient.js";
+import { StudioRpcError } from "./rpcClient.js";
+import { RemoteControlClient } from "./remoteControl.js";
+import {
+  loadDoc,
+  saveDoc,
+  resolveNode,
+  createInstance,
+  createInstances,
+  updateInstance,
+  moveInstance,
+  duplicateInstance,
+  findNodes,
+  deleteByGuid,
+  findProjectFile,
+  type CreateProps,
+} from "./ovdrjm.js";
+import { ASSET_CATALOG, findAsset, isOvdrAssetId } from "./assets.js";
+import { registerKnowledge } from "./knowledge.js";
+
+type Json = Record<string, unknown>;
+
+const clean = (obj: Json): Json =>
+  Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+
+function ok(data: unknown) {
+  const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  return { content: [{ type: "text" as const, text: text || "(no result)" }] };
+}
+
+function fail(err: unknown) {
+  const msg =
+    err instanceof StudioRpcError
+      ? err.message
+      : `Unexpected error: ${(err as Error)?.message ?? String(err)}`;
+  return { content: [{ type: "text" as const, text: msg }], isError: true };
+}
+
+/** A clean validation/guard-rail error (no "Unexpected error:" prefix). */
+function errOut(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
+/** Friendly instance props (mirrors ovdrjm CreateProps) — shared by the
+ *  create/update/bulk edit tools. All optional; `raw` is the escape hatch. */
+const PROPS_SHAPE = z.object({
+  position: z.array(z.number()).length(3).optional().describe("[X,Y,Z] world position."),
+  orientation: z.array(z.number()).length(3).optional().describe("[X,Y,Z] degrees."),
+  size: z.array(z.number()).length(3).optional().describe("[X,Y,Z] size."),
+  color: z.array(z.number()).length(3).optional().describe("[R,G,B] 0-255."),
+  anchored: z.boolean().optional(),
+  canCollide: z.boolean().optional(),
+  transparency: z.number().optional().describe("0 (opaque) - 1 (invisible)."),
+  mobility: z.enum(["Movable", "Static"]).optional(),
+  meshId: z.string().optional(),
+  shape: z.enum(["Block", "Ball", "Cylinder"]).optional(),
+  material: z.string().optional().describe("e.g. Plastic, Metal, Glass, Neon, Wood, Marble, Concrete, Brick."),
+  castShadow: z.boolean().optional(),
+  canTouch: z.boolean().optional(),
+  canQuery: z.boolean().optional(),
+  canClimb: z.boolean().optional(),
+  locked: z.boolean().optional(),
+  collisionProfile: z.string().optional(),
+  collisionGroup: z.string().optional(),
+  materialVariant: z.string().optional(),
+  raw: z.record(z.any()).optional().describe("Verbatim ovdrjm fields (e.g. UDim2 Position/Size for UI, nested BrickColor)."),
+});
+
+export function registerTools(server: McpServer, client: StudioRpcClient) {
+  const tool = (
+    name: string,
+    description: string,
+    shape: z.ZodRawShape,
+    method: string,
+    map: (args: Json) => Json = (a) => a,
+  ) => {
+    server.registerTool(
+      name,
+      { description, inputSchema: shape },
+      async (args: Json) => {
+        try {
+          return ok(await client.call(method, clean(map(args))));
+        } catch (err) {
+          return fail(err);
+        }
+      },
+    );
+  };
+
+  // Recipes/knowledge (MCP resources + overdare_recipe) — battle-tested
+  // build playbooks adapted from the built-in agent's skills.
+  registerKnowledge(server);
+
+  // ---- Read --------------------------------------------------------------
+  tool(
+    "overdare_browse",
+    "Browse the live OVERDARE DataModel tree (Workspace, Players, ReplicatedStorage, ServerScriptService, StarterGui, etc). Returns nodes as { guid, name, class, children }. ALWAYS call this first — every other tool targets nodes by their `guid`.",
+    {},
+    "level.browse",
+  );
+
+  // ---- Scripts (Luau) ----------------------------------------------------
+  tool(
+    "overdare_script_add",
+    "Create a Luau script under a parent instance (found via overdare_browse). Use TABS for indentation. Good parents: ServerScriptService (Script), StarterPlayer.StarterPlayerScripts (LocalScript), ReplicatedStorage (ModuleScript).",
+    {
+      class: z
+        .enum(["Script", "LocalScript", "ModuleScript"])
+        .describe("Script kind: Script=server, LocalScript=client, ModuleScript=shared library."),
+      parentGuid: z.string().describe("GUID of the parent instance (from overdare_browse)."),
+      name: z.string().describe("Script name."),
+      source: z.string().describe("Luau source code (tabs for indentation)."),
+    },
+    "script.add",
+  );
+
+  // ---- Mutate ------------------------------------------------------------
+  tool(
+    "overdare_instance_delete",
+    "Delete one or more instances by GUID (and their descendants). Irreversible — confirm intent before calling.",
+    {
+      guids: z
+        .array(z.string())
+        .min(1)
+        .describe("GUIDs to delete (from overdare_browse)."),
+    },
+    "instance.delete",
+    (a) => ({ items: (a.guids as string[]).map((targetGuid) => ({ targetGuid })) }),
+  );
+
+  // ---- Project / lifecycle ----------------------------------------------
+  tool(
+    "overdare_save",
+    "Save the project to disk (.ovdrjm/.umap). Call after meaningful changes.",
+    {},
+    "level.save.file",
+  );
+
+  tool(
+    "overdare_apply",
+    "Tell Studio to apply/reload pending level changes. Used after low-level edits; safe to call to refresh state.",
+    {},
+    "level.apply",
+  );
+
+  tool(
+    "overdare_publish",
+    "Publish the world to the OVERDARE Hub.",
+    {},
+    "level.publish",
+  );
+
+  // ---- Playtest ----------------------------------------------------------
+  tool(
+    "overdare_play",
+    "Start a playtest of the current level. Optionally simulate multiple players.",
+    { numberOfPlayer: z.number().int().positive().optional().describe("Number of players to simulate (default 1).") },
+    "game.play",
+  );
+  tool("overdare_stop", "Stop the running playtest.", {}, "game.stop");
+
+  // Screenshot returns a saved PNG path — read it back so the model can SEE it.
+  server.registerTool(
+    "overdare_screenshot",
+    {
+      description:
+        "Capture the live Studio viewport / running game and return the image so you can visually verify the scene. Great for 'visual-first' iteration: change something, then look.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const res = (await client.call("game.screenshot", {})) as {
+          path?: string;
+          success?: boolean;
+        };
+        const path = res?.path;
+        if (!path) return ok(res);
+        try {
+          const buf = await readFile(path);
+          return {
+            content: [
+              { type: "image" as const, data: buf.toString("base64"), mimeType: "image/png" },
+              { type: "text" as const, text: `Saved: ${path}` },
+            ],
+          };
+        } catch {
+          // Couldn't read the file (e.g. path on another machine) — return path only.
+          return ok(res);
+        }
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ======================================================================
+  //  ASSET IMPORT  (Asset Drawer models + local images)
+  //  Pull in pro-made content by id instead of hand-building primitives.
+  //  A BAD asset id HANGS Studio — pick ids via overdare_assets, import only
+  //  with the playtest STOPPED.
+  // ======================================================================
+  server.registerTool(
+    "overdare_assets",
+    {
+      description:
+        "List the curated OVERDARE Asset Drawer catalog (official UI screens + a PvP combat template) so you can pick a KNOWN-GOOD id to import with overdare_asset_import. Guessing an id is dangerous (a bad id hangs Studio). No Studio call; safe anytime.",
+      inputSchema: {
+        category: z.enum(["ui", "combat", "world"]).optional().describe("Filter by category."),
+        query: z.string().optional().describe("Case-insensitive substring match on name/description."),
+      },
+    },
+    async (a: Json) => {
+      const cat = a.category as string | undefined;
+      const q = (a.query as string | undefined)?.toLowerCase();
+      const rows = ASSET_CATALOG.filter(
+        (e) =>
+          (!cat || e.category === cat) &&
+          (!q || e.name.toLowerCase().includes(q) || e.description.toLowerCase().includes(q)),
+      );
+      return ok(rows);
+    },
+  );
+
+  server.registerTool(
+    "overdare_asset_import",
+    {
+      description:
+        "Import an Asset Drawer model into the level by id (a full UI screen, the combat template, etc.). It lands under Workspace — relocate with overdare_move_instance (UI -> StarterGui). DANGER: a wrong id permanently HANGS Studio. Pick ids from overdare_assets, STOP the playtest, then set confirmStopped=true.",
+      inputSchema: {
+        assetId: z.string().describe('Asset Drawer id "ovdrassetid://NUMBER" (use overdare_assets to pick).'),
+        assetName: z.string().optional().describe("Display name; defaults from the catalog when the id is known."),
+        confirmStopped: z
+          .boolean()
+          .default(false)
+          .describe("Must be true: confirms the playtest is STOPPED. Importing during play (or a bad id) hangs Studio."),
+      },
+    },
+    async (a: Json) => {
+      const assetId = (a.assetId as string)?.trim();
+      if (!isOvdrAssetId(assetId))
+        return errOut(
+          `Invalid assetId "${assetId}". Must be "ovdrassetid://NUMBER". Use overdare_assets to pick a known-good id.`,
+        );
+      if (a.confirmStopped !== true)
+        return errOut(
+          "Refusing to import: stop the playtest (overdare_stop), then call again with confirmStopped=true. Importing during play hangs Studio.",
+        );
+      const known = findAsset(assetId);
+      const assetName = (a.assetName as string) ?? known?.name;
+      if (!assetName)
+        return errOut(`assetName is required for an id not in the catalog (${assetId}).`);
+      try {
+        const result = await client.call("asset_drawer.import", {
+          assetid: assetId,
+          assetName,
+          assetType: "MODEL",
+        });
+        const warn = known
+          ? ""
+          : `WARNING: ${assetId} is not in the curated catalog — verify it is a real Asset Drawer MODEL id (a bad id hangs Studio).\n`;
+        return ok(warn + JSON.stringify({ imported: assetId, assetName, result }, null, 2));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_image_import",
+    {
+      description:
+        "Import a local image file (PNG/JPG) into the asset manager and return the created asset id — use it as Image/Decal content (e.g. on an ImageLabel or a Texture). STOP the playtest first. Not subject to the bad-id hang (no id input).",
+      inputSchema: {
+        file: z.string().describe("Absolute path to a local image file (PNG/JPG)."),
+      },
+    },
+    async (a: Json) => {
+      const file = (a.file as string)?.trim();
+      if (!file) return errOut("file (absolute path) is required.");
+      if (!existsSync(file)) return errOut(`File not found: ${file}`);
+      try {
+        return ok(await client.call("asset_manager.image.import", { file }));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ======================================================================
+  //  EDIT-TIME ENGINE  (.ovdrjm direct edit + level.apply)
+  //  Creates persistent instances the RPC can't (instance.upsert is absent).
+  //  MUST NOT run during an active playtest (hangs Studio) — stop first.
+  // ======================================================================
+  let projectFile: string | null = null;
+  async function getProjectFile(): Promise<string> {
+    if (projectFile) return projectFile;
+    const envDir = process.env.OVERDARE_PROJECT_DIR;
+    if (envDir) return (projectFile = findProjectFile(envDir));
+    // Discover the project dir from a screenshot path: <dir>/Screenshots/Agent/*.png
+    const res = (await client.call("game.screenshot", {})) as { path?: string };
+    if (!res?.path) throw new Error("Could not discover project dir (set OVERDARE_PROJECT_DIR).");
+    const dir = res.path.replace(/[\\/]+Screenshots[\\/].*$/i, "");
+    return (projectFile = findProjectFile(dir));
+  }
+
+  async function applyEdit(mutate: (doc: ReturnType<typeof loadDoc>) => unknown) {
+    const file = await getProjectFile();
+    const doc = loadDoc(file);
+    const result = mutate(doc);
+    saveDoc(file, doc);
+    const apply = await client.call("level.apply", {});
+    return { result, apply };
+  }
+
+  server.registerTool(
+    "overdare_create_part",
+    {
+      description:
+        "Create a persistent Part in the editor (not runtime) by editing the .ovdrjm and reloading. Use for real, saveable map geometry. STOP any playtest first. Position/size/color scale to the world (character height ~160; baseplate is huge).",
+      inputSchema: {
+        parent: z.string().default("Workspace").describe("Parent GUID or dotted path (default Workspace)."),
+        name: z.string().describe("Part name."),
+        position: z.array(z.number()).length(3).describe("[X,Y,Z] world position."),
+        size: z.array(z.number()).length(3).default([300, 300, 300]).describe("[X,Y,Z] size."),
+        color: z.array(z.number()).length(3).default([163, 162, 165]).describe("[R,G,B] 0-255."),
+        anchored: z.boolean().default(true),
+        material: z.string().optional().describe("e.g. Plastic, Metal, Glass, Neon, Wood, Marble, Concrete."),
+        shape: z.enum(["Block", "Ball", "Cylinder"]).optional(),
+        transparency: z.number().optional().describe("0 (opaque) - 1 (invisible)."),
+        canCollide: z.boolean().optional(),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const parent = resolveNode(doc, (a.parent as string) ?? "Workspace");
+          if (!parent) throw new Error(`Parent not found: ${a.parent}`);
+          const node = createInstance(doc, parent, "Part", a.name as string, {
+            position: a.position as CreateProps["position"],
+            size: a.size as CreateProps["size"],
+            color: a.color as CreateProps["color"],
+            anchored: a.anchored as boolean,
+            material: a.material as string | undefined,
+            shape: a.shape as CreateProps["shape"],
+            transparency: a.transparency as number | undefined,
+            canCollide: a.canCollide as boolean | undefined,
+          });
+          return { guid: node.ActorGuid, objectKey: node.ObjectKey };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_create_instance",
+    {
+      description:
+        "Create a persistent instance of any class in the editor by editing the .ovdrjm (e.g. Folder, Model, MeshPart, Part). STOP any playtest first. `props` accepts position/size/color/anchored/meshId, plus `raw` for verbatim fields.",
+      inputSchema: {
+        className: z.string().describe('e.g. "Folder", "Model", "Part", "MeshPart".'),
+        parent: z.string().default("Workspace").describe("Parent GUID or dotted path."),
+        name: z.string(),
+        props: PROPS_SHAPE.optional(),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const parent = resolveNode(doc, (a.parent as string) ?? "Workspace");
+          if (!parent) throw new Error(`Parent not found: ${a.parent}`);
+          const node = createInstance(doc, parent, a.className as string, a.name as string, (a.props as CreateProps) ?? {});
+          return { guid: node.ActorGuid, objectKey: node.ObjectKey };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_delete_instance",
+    {
+      description:
+        "Permanently delete an instance by GUID by editing the .ovdrjm and reloading. STOP any playtest first. (For scripts, prefer overdare_rpc script.delete.)",
+      inputSchema: { guid: z.string().describe("ActorGuid to delete (from overdare_browse).") },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const removed = deleteByGuid(doc.Root, a.guid as string);
+          if (!removed) throw new Error(`GUID not found: ${a.guid}`);
+          return { deleted: a.guid };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_update_instance",
+    {
+      description:
+        "Modify an existing instance's properties (and/or rename it) by GUID — edits the .ovdrjm and reloads. STOP any playtest first. Use after import/create to tweak material, color, size, transparency, etc. `props` is the same shape as overdare_create_instance.",
+      inputSchema: {
+        guid: z.string().describe("ActorGuid to update (from overdare_browse)."),
+        props: PROPS_SHAPE.optional(),
+        name: z.string().optional().describe("New name (optional)."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const node = updateInstance(
+            doc,
+            a.guid as string,
+            (a.props as CreateProps) ?? {},
+            a.name as string | undefined,
+          );
+          return { guid: node.ActorGuid, name: node.Name };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_move_instance",
+    {
+      description:
+        'Reparent an instance under a new parent — edits the .ovdrjm and reloads. STOP any playtest first. Essential after overdare_asset_import (imports land under Workspace; move UI to "StarterGui").',
+      inputSchema: {
+        guid: z.string().describe("ActorGuid to move (from overdare_browse)."),
+        newParent: z.string().describe('New parent GUID or dotted path (e.g. "StarterGui").'),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const parent = resolveNode(doc, a.newParent as string);
+          if (!parent) throw new Error(`New parent not found: ${a.newParent}`);
+          if (!parent.ActorGuid) throw new Error(`New parent has no GUID (cannot move here): ${a.newParent}`);
+          moveInstance(doc.Root, a.guid as string, parent.ActorGuid);
+          return { moved: a.guid, to: parent.ActorGuid, parentName: parent.Name };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_create_instances",
+    {
+      description:
+        "Bulk-create multiple instances under one parent in a single edit (one reload). STOP any playtest first. Best for classes already present in the project (e.g. Part); for novel classes, import a template first. Max 50.",
+      inputSchema: {
+        parent: z.string().default("Workspace").describe("Parent GUID or dotted path."),
+        items: z
+          .array(
+            z.object({
+              className: z.string(),
+              name: z.string(),
+              props: PROPS_SHAPE.optional(),
+            }),
+          )
+          .min(1)
+          .max(50)
+          .describe("Instances to create."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          const parent = resolveNode(doc, (a.parent as string) ?? "Workspace");
+          if (!parent) throw new Error(`Parent not found: ${a.parent}`);
+          const nodes = createInstances(
+            doc,
+            parent,
+            a.items as Array<{ className: string; name: string; props?: CreateProps }>,
+          );
+          return nodes.map((n) => ({ guid: n.ActorGuid, name: n.Name }));
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ======================================================================
+  //  READ / SEARCH / EDIT existing content (.ovdrjm — fills absent RPCs)
+  //  instance.read / script.read / script.edit are -32002 on this build, but
+  //  the data lives in the .ovdrjm, so we serve it from the file.
+  // ======================================================================
+  server.registerTool(
+    "overdare_read_instance",
+    {
+      description:
+        "Read an instance's properties from the saved project (.ovdrjm) — fills the gap left by the absent instance.read RPC. Returns the node's fields (Material, Size, CFrame, Transparency, …) plus a summary of its children. Pair with overdare_update_instance to change them. (Reads the saved file — overdare_save first if you have unsaved edits.)",
+      inputSchema: {
+        ref: z.string().describe('ActorGuid or dotted path (e.g. "Workspace.Baseplate").'),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const doc = loadDoc(await getProjectFile());
+        const node = resolveNode(doc, a.ref as string);
+        if (!node) return errOut(`Not found: ${a.ref}`);
+        const { LuaChildren, ...props } = node;
+        const children = (LuaChildren ?? []).map((c) => ({ guid: c.ActorGuid, name: c.Name, class: c.InstanceType }));
+        return ok({ ...props, childCount: children.length, children: children.slice(0, 50) });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_script_read",
+    {
+      description:
+        "Read an existing script's Luau source from the saved project (.ovdrjm) — fills the gap left by the absent script.read RPC. Use before overdare_script_edit to see what you're changing.",
+      inputSchema: {
+        ref: z.string().describe("ActorGuid or dotted path of a Script/LocalScript/ModuleScript."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const doc = loadDoc(await getProjectFile());
+        const node = resolveNode(doc, a.ref as string);
+        if (!node) return errOut(`Not found: ${a.ref}`);
+        if (node.Source === undefined)
+          return errOut(`Not a script (no Source field): ${a.ref} [${node.InstanceType}]`);
+        return ok({
+          guid: node.ActorGuid,
+          name: node.Name,
+          class: node.InstanceType,
+          enabled: node.Enabled,
+          source: node.Source,
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_find",
+    {
+      description:
+        "Search the project tree by name substring and/or class, returning matching nodes with guid + dotted path. Far more practical than overdare_browse on large projects (e.g. after importing the TPA combat template).",
+      inputSchema: {
+        query: z.string().optional().describe("Case-insensitive name substring."),
+        className: z.string().optional().describe('Exact InstanceType, e.g. "Part", "Script", "TextButton".'),
+        limit: z.number().int().default(50),
+      },
+    },
+    async (a: Json) => {
+      try {
+        if (!a.query && !a.className) return errOut("Provide query and/or className.");
+        const doc = loadDoc(await getProjectFile());
+        const hits = findNodes(doc.Root, {
+          name: a.query as string | undefined,
+          className: a.className as string | undefined,
+          limit: a.limit as number,
+        });
+        return ok(hits.map((h) => ({ guid: h.node.ActorGuid, name: h.node.Name, class: h.node.InstanceType, path: h.path })));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_script_edit",
+    {
+      description:
+        "Replace an existing script's Luau source (and/or toggle Enabled) by editing the .ovdrjm and reloading — fills the gap left by the absent script.edit RPC. STOP any playtest first. Use TABS for indentation. (To create a NEW script use overdare_script_add.)",
+      inputSchema: {
+        guid: z.string().describe("ActorGuid of the script (from overdare_find/browse)."),
+        source: z.string().optional().describe("New full Luau source (tabs for indentation)."),
+        enabled: z.boolean().optional().describe("Enable/disable the script."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        if (a.source === undefined && a.enabled === undefined) return errOut("Provide source and/or enabled.");
+        const out = await applyEdit((doc) => {
+          const node = resolveNode(doc, a.guid as string);
+          if (!node) throw new Error(`Not found: ${a.guid}`);
+          if (node.Source === undefined)
+            throw new Error(`Not a script (no Source field): ${a.guid} [${node.InstanceType}]`);
+          if (a.source !== undefined) node.Source = a.source as string;
+          if (a.enabled !== undefined) node.Enabled = a.enabled as boolean;
+          return { guid: node.ActorGuid, name: node.Name, enabled: node.Enabled };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_duplicate_instance",
+    {
+      description:
+        "Duplicate an existing instance (and its whole subtree) with fresh GUIDs by editing the .ovdrjm and reloading. STOP any playtest first. Great for replicating a built platform or decorated model. Internal weld/ref links aren't remapped (fine for parts/models/scripts/UI).",
+      inputSchema: {
+        guid: z.string().describe("ActorGuid to duplicate (from overdare_find/browse)."),
+        parent: z.string().optional().describe("New parent GUID/path (default: same parent as the original)."),
+        name: z.string().optional().describe("Name for the copy (default: <Original>_Copy)."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const out = await applyEdit((doc) => {
+          let newParentGuid: string | undefined;
+          if (a.parent) {
+            const parent = resolveNode(doc, a.parent as string);
+            if (!parent || !parent.ActorGuid) throw new Error(`Parent not found / no GUID: ${a.parent}`);
+            newParentGuid = parent.ActorGuid;
+          }
+          const copy = duplicateInstance(doc, a.guid as string, newParentGuid, a.name as string | undefined);
+          return { guid: copy.ActorGuid, name: copy.Name };
+        });
+        return ok(out.result);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ======================================================================
+  //  UNREAL REMOTE CONTROL  (127.0.0.1:30010) — low-level engine layer
+  // ======================================================================
+  const rc = new RemoteControlClient();
+
+  // Unreal Python is optional in OVERDARE's UE build — probe once (read-only,
+  // via describe) and cache the result so we never run code on a missing plugin.
+  const PY_OBJ = "/Script/PythonScriptPlugin.Default__PythonScriptLibrary";
+  let pythonProbe: boolean | null = null;
+  async function pythonAvailable(): Promise<boolean> {
+    if (pythonProbe !== null) return pythonProbe;
+    try {
+      await rc.describe(PY_OBJ);
+      pythonProbe = true;
+    } catch {
+      pythonProbe = false;
+    }
+    return pythonProbe;
+  }
+
+  server.registerTool(
+    "overdare_rc_search_assets",
+    {
+      description:
+        "Search OVERDARE's Unreal asset library (StaticMesh, Texture2D, etc.) via Remote Control. Use to find 3D meshes/textures by name or class. e.g. classNames=['StaticMesh'], query='tree'.",
+      inputSchema: {
+        query: z.string().default("").describe("Name substring."),
+        classNames: z.array(z.string()).optional().describe('e.g. ["StaticMesh"].'),
+        packagePaths: z.array(z.string()).optional().describe('e.g. ["/Game/CreatorPlatform"].'),
+        recursive: z.boolean().default(true),
+        limit: z.number().int().default(25),
+      },
+    },
+    async (a: Json) => {
+      try {
+        return ok(
+          await rc.searchAssets({
+            query: a.query as string,
+            classNames: a.classNames as string[] | undefined,
+            packagePaths: a.packagePaths as string[] | undefined,
+            recursive: a.recursive as boolean,
+            limit: a.limit as number,
+          }),
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_rc_call",
+    {
+      description:
+        "Call a UFunction on an Unreal object via Remote Control (advanced, low-level). objectPath is a UObject path; functionName + parameters per the UFunction signature.",
+      inputSchema: {
+        objectPath: z.string(),
+        functionName: z.string(),
+        parameters: z.record(z.any()).optional(),
+      },
+    },
+    async (a: Json) => {
+      try {
+        return ok(await rc.call(a.objectPath as string, a.functionName as string, (a.parameters as Json) ?? {}));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_rc_property",
+    {
+      description:
+        "Read or write a property on an Unreal object via Remote Control. Omit `value` to read; provide it to write.",
+      inputSchema: {
+        objectPath: z.string(),
+        propertyName: z.string(),
+        value: z.any().optional().describe("If provided, writes; otherwise reads."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        if (a.value === undefined)
+          return ok(await rc.getProperty(a.objectPath as string, a.propertyName as string));
+        return ok(await rc.setProperty(a.objectPath as string, a.propertyName as string, a.value));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_rc_describe",
+    {
+      description: "Describe an Unreal object (its properties/functions) via Remote Control.",
+      inputSchema: { objectPath: z.string() },
+    },
+    async (a: Json) => {
+      try {
+        return ok(await rc.describe(a.objectPath as string));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_rc_batch",
+    {
+      description:
+        "Run several Unreal Remote Control requests in one round-trip (PUT /remote/batch). Each item is {URL, Verb, Body?}. Advanced/low-level — efficient for bulk property reads/writes on UObjects.",
+      inputSchema: {
+        requests: z
+          .array(
+            z.object({
+              RequestId: z.number().optional(),
+              URL: z.string().describe('e.g. "/remote/object/property".'),
+              Verb: z.string().describe('"GET" | "PUT".'),
+              Body: z.record(z.any()).optional(),
+            }),
+          )
+          .min(1)
+          .describe("Remote Control requests to batch."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        return ok(
+          await rc.batch(
+            a.requests as Array<{ RequestId?: number; URL: string; Verb: string; Body?: unknown }>,
+          ),
+        );
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_rc_python",
+    {
+      description:
+        "Run an Unreal Python command in the editor (ExecutePythonCommand) via Remote Control. EXPERIMENTAL — OVERDARE's build may omit/sandbox the Python plugin; this tool first probes availability (read-only) and refuses if absent. NOTE: Python acts on the live Unreal level, NOT the saveable Lua/.ovdrjm layer — changes won't persist to the game.",
+      inputSchema: {
+        command: z.string().describe('Unreal Python source, e.g. "import unreal; print(unreal.SystemLibrary.get_engine_version())".'),
+      },
+    },
+    async (a: Json) => {
+      try {
+        if (!(await pythonAvailable()))
+          return errOut("Unreal Python is not available in this OVERDARE build (PythonScriptLibrary not found via Remote Control).");
+        return ok(await rc.call(PY_OBJ, "ExecutePythonCommand", { CommandString: a.command as string }, false));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "overdare_rc_list_actors",
+    {
+      description:
+        "Introspect a live Unreal object via Remote Control describe (EXPERIMENTAL, low-level). The OVERDARE world/level object path is build-specific — pass objectPath to inspect a known object. For the game DataModel tree, use overdare_browse instead.",
+      inputSchema: {
+        objectPath: z
+          .string()
+          .optional()
+          .describe('UObject path to describe (e.g. a path from overdare_rc_search_assets). Defaults to a generic engine object.'),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const path = (a.objectPath as string) ?? "/Script/Engine.Default__GameInstance";
+        return ok(await rc.describe(path));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ---- Diagnostics (capability/health, à la Blender MCP's *_status) ------
+  server.registerTool(
+    "overdare_status",
+    {
+      description:
+        "Diagnostic: report what's reachable and configured — Studio RPC (13377), UE Remote Control (30010), Unreal Python availability, the resolved project file, and OVERDARE_PROJECT_DIR. Call this first when something isn't working, or to confirm the environment before building. (May take a few seconds if Studio is down.)",
+      inputSchema: {},
+    },
+    async () => {
+      const out: Record<string, unknown> = { server: "overdare-mcp" };
+      try {
+        await client.call("level.browse", {});
+        out.studioRpc = `reachable (${client.endpoint})`;
+      } catch (e) {
+        out.studioRpc = `UNREACHABLE — is OVERDARE Studio running with a project open? (${client.endpoint})`;
+      }
+      let rcUp = false;
+      try {
+        await rc.info();
+        rcUp = true;
+        out.ueRemoteControl = `reachable (${rc.endpoint})`;
+      } catch {
+        out.ueRemoteControl = `unreachable (${rc.endpoint})`;
+      }
+      out.unrealPython = rcUp ? ((await pythonAvailable()) ? "available" : "absent") : "unknown (Remote Control down)";
+      out.projectDirEnv = process.env.OVERDARE_PROJECT_DIR ?? "(not set — discovered from a screenshot path)";
+      try {
+        out.projectFile = await getProjectFile();
+      } catch (e) {
+        out.projectFile = `unresolved (${(e as Error).message.slice(0, 70)})`;
+      }
+      return ok(out);
+    },
+  );
+
+  // ---- Escape hatch ------------------------------------------------------
+  server.registerTool(
+    "overdare_rpc",
+    {
+      description:
+        "Low-level escape hatch: call any Studio RPC method with raw params. Use for methods without a dedicated tool or to probe the protocol. Verified methods: level.browse/apply/save.file/publish, script.add, instance.delete, game.play/stop/screenshot. (Note: instance.read/upsert/move and script.read/edit/grep are NOT available on the current Studio build.)",
+      inputSchema: {
+        method: z.string().describe('RPC method, e.g. "level.browse".'),
+        params: z.record(z.any()).optional().describe("Raw params object."),
+      },
+    },
+    async (args: Json) => {
+      try {
+        return ok(await client.call(args.method as string, (args.params as Json) ?? {}));
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+}

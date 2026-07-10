@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "overdare": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/overdare-mcp/dist/index.js"],
+      "env": {
+        "STUDIO_HOST": "127.0.0.1",
+        "STUDIO_PORT": "13377"
+      }
+    }
+  }
+}

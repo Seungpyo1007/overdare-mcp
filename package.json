@@ -1,0 +1,40 @@
+{
+  "name": "overdare-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that bridges OVERDARE Studio's local RPC (localhost:13377) so AI agents can browse, edit, script, and playtest OVERDARE games.",
+  "type": "module",
+  "bin": {
+    "overdare": "dist/cli.js",
+    "overdare-server": "dist/http.js",
+    "overdare-mcp": "dist/index.js"
+  },
+  "main": "dist/http.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "serve": "node dist/http.js",
+    "cli": "node dist/cli.js",
+    "mcp": "node dist/index.js",
+    "mcptest": "node dist/mcptest.js",
+    "probe": "node dist/probe.js"
+  },
+  "keywords": [
+    "mcp",
+    "overdare",
+    "studio",
+    "luau",
+    "game",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^5.2.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
