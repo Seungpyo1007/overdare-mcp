@@ -13,14 +13,55 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 const execFileP = promisify(execFile);
+
+/** Read the last N bytes of a (possibly huge) file. */
+function tailFile(path: string, bytes = 512 * 1024): string {
+  const st = statSync(path);
+  const start = Math.max(0, st.size - bytes);
+  const len = st.size - start;
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, start);
+    return buf.toString("latin1");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Which project is loaded, from Studio's own log — light and side-effect free.
+ * Studio logs `... FILE="../../../../Users/<u>/.../<name>/<name>.umap"` on every
+ * (auto)save; the newest one identifies the open project.
+ */
+function discoverProjectDirFromLog(): string | null {
+  try {
+    const local = process.env.LOCALAPPDATA;
+    if (!local) return null;
+    const log = join(local, "Sandbox", "Saved", "Logs", "Sandbox.log");
+    if (!existsSync(log)) return null;
+    const txt = tailFile(log);
+    const re = /FILE="([^"]+\.umap)"/g;
+    let m: RegExpExecArray | null;
+    let last: string | null = null;
+    while ((m = re.exec(txt)) !== null) last = m[1];
+    if (!last) return null;
+    const tail = last.replace(/^(\.\.[\\/])+/, "").replace(/\\/g, "/");
+    const drive = (log.match(/^[A-Za-z]:/) ?? ["C:"])[0];
+    const dir = dirname(`${drive}/${tail}`);
+    return existsSync(dir) ? dir : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Locate a Blender executable: env override, then common Windows installs, then PATH. */
 function findBlender(): string {
@@ -452,10 +493,25 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     if (projectFile) return projectFile;
     // 1) explicit override (overdare_set_project)
     if (projectOverrideDir) return (projectFile = findProjectFile(projectOverrideDir));
-    // 2) the project actually loaded in Studio — auto-follows project switches
+    // 2) Studio's own log names the loaded project — cheap, side-effect free
+    const fromLog = discoverProjectDirFromLog();
+    if (fromLog) {
+      try {
+        return (projectFile = findProjectFile(fromLog));
+      } catch {
+        /* no .ovdrjm there — keep looking */
+      }
+    }
+    // 3) screenshot path (heavier; can time out while Studio is busy)
     const live = await discoverLoadedProjectDir();
-    if (live) return (projectFile = findProjectFile(live));
-    // 3) env fallback
+    if (live) {
+      try {
+        return (projectFile = findProjectFile(live));
+      } catch {
+        /* keep looking */
+      }
+    }
+    // 4) env fallback
     const envDir = process.env.OVERDARE_PROJECT_DIR;
     if (envDir) return (projectFile = findProjectFile(envDir));
     throw new Error(
