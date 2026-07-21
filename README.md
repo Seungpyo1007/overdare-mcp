@@ -81,6 +81,28 @@ For **Claude Desktop**, add the same block under `mcpServers` in
 | `overdare_game_screenshot` | `game.screenshot` | Capture the viewport |
 | `overdare_rpc` | _any_ | Escape hatch: call any RPC method with raw params |
 
+## Smart mesh import (`overdare_mesh_prepare`)
+
+OVERDARE caps imported meshes at **30,000 triangles per mesh** and recommends
+**512px** textures (large 4K textures OOM the importer). `overdare_mesh_prepare`
+runs **headless Blender** to make any `.fbx / .obj / .glb / .gltf / .blend`
+import-ready:
+
+- decimates an over-budget mesh to fit the triangle limit,
+- downscales & re-embeds textures to the target size,
+- writes a self-contained `<name>_overdare.fbx`.
+
+The final Import into Studio (Home ▸ Import) is still a manual GUI step. Requires
+Blender installed — Steam installs are auto-detected; set `OVERDARE_BLENDER` to
+override the path.
+
+## Switching projects (`overdare_set_project`)
+
+The `.ovdrjm` file-edit tools now **auto-follow whichever project is open in
+Studio** (recovered from its screenshot path). After switching projects in
+Studio, call `overdare_set_project` with no args to re-detect, or pass a `dir` to
+pin a specific project directory. `OVERDARE_PROJECT_DIR` remains a fallback.
+
 ## Status / next steps
 
 The RPC endpoint, port, and method names were derived from the OVERDARE Studio

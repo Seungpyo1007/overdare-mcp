@@ -13,8 +13,45 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
+
+const execFileP = promisify(execFile);
+
+/** Locate a Blender executable: env override, then common Windows installs, then PATH. */
+function findBlender(): string {
+  const env = process.env.OVERDARE_BLENDER || process.env.BLENDER_PATH;
+  if (env && existsSync(env)) return env;
+  // direct, non-versioned locations (Steam installs blender.exe here)
+  for (const p of [
+    "C:/Program Files (x86)/Steam/steamapps/common/Blender/blender.exe",
+    "C:/Program Files/Steam/steamapps/common/Blender/blender.exe",
+  ]) {
+    if (existsSync(p)) return p;
+  }
+  const bases = [
+    "C:/Program Files/Blender Foundation",
+    "C:/Program Files (x86)/Blender Foundation",
+  ];
+  const found: string[] = [];
+  for (const base of bases) {
+    try {
+      if (!existsSync(base)) continue;
+      for (const d of readdirSync(base)) {
+        const exe = `${base}/${d}/blender.exe`;
+        if (existsSync(exe)) found.push(exe);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  if (found.length) return found.sort().reverse()[0]; // newest version dir
+  return "blender"; // rely on PATH
+}
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { StudioRpcClient } from "./rpcClient.js";
 import { StudioRpcError } from "./rpcClient.js";
@@ -305,20 +342,125 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
   );
 
   // ======================================================================
+  //  SMART MESH IMPORT PREP  (headless Blender: fit the 30k-tri + texture limits)
+  // ======================================================================
+  server.registerTool(
+    "overdare_mesh_prepare",
+    {
+      description:
+        "Make any 3D file OVERDARE-import-ready via headless Blender: joins meshes, decimates to the per-mesh triangle budget (OVERDARE limit = 30,000), and downscales textures (OVERDARE recommends 512; large 4K textures OOM the importer). Accepts .fbx/.obj/.glb/.gltf/.blend and writes <name>_overdare.fbx (textures embedded) next to the input (or in outDir). The final Import into Studio is still a manual GUI step (Home > Import). Requires Blender installed — set OVERDARE_BLENDER to override the path.",
+      inputSchema: {
+        file: z
+          .string()
+          .describe("Absolute path to the source 3D file (.fbx/.obj/.glb/.gltf/.blend)."),
+        maxTris: z
+          .number()
+          .int()
+          .default(30000)
+          .describe("Triangle budget per mesh (OVERDARE limit = 30000)."),
+        textureSize: z
+          .number()
+          .int()
+          .default(1024)
+          .describe("Max texture dimension in px (OVERDARE recommends 512; 1024 balances detail/size)."),
+        mode: z
+          .enum(["decimate", "keep"])
+          .default("decimate")
+          .describe("'decimate' reduces an over-budget mesh to fit; 'keep' only fits textures."),
+        outDir: z
+          .string()
+          .optional()
+          .describe("Output directory (default: same folder as the input file)."),
+      },
+    },
+    async (a: Json) => {
+      try {
+        const file = a.file as string;
+        if (!existsSync(file)) return errOut(`File not found: ${file}`);
+        const maxTris = (a.maxTris as number) ?? 30000;
+        const texSize = (a.textureSize as number) ?? 1024;
+        const mode = (a.mode as string) ?? "decimate";
+        const outDir = (a.outDir as string) || dirname(file);
+        const blender = findBlender();
+        const script = fileURLToPath(new URL("../scripts/prepare_mesh.py", import.meta.url));
+        if (!existsSync(script)) return errOut(`prepare_mesh.py not found at ${script}`);
+        const args = [
+          "--background",
+          "--python",
+          script,
+          "--",
+          file,
+          outDir,
+          String(maxTris),
+          String(texSize),
+          mode,
+        ];
+        let stdout = "";
+        try {
+          const r = await execFileP(blender, args, {
+            timeout: 300000,
+            maxBuffer: 32 * 1024 * 1024,
+          });
+          stdout = r.stdout || "";
+        } catch (e) {
+          const err = e as { stdout?: string; message?: string };
+          stdout = err.stdout || "";
+          if (!stdout.includes("PREPARE_RESULT_JSON")) {
+            return errOut(`Blender run failed (${blender}): ${err.message ?? String(e)}`);
+          }
+        }
+        const line = stdout
+          .split(/\r?\n/)
+          .find((l) => l.startsWith("PREPARE_RESULT_JSON "));
+        if (!line) return errOut(`No result from Blender. Output tail:\n${stdout.slice(-1200)}`);
+        const res = JSON.parse(line.slice("PREPARE_RESULT_JSON ".length));
+        if (!res.ok) return errOut(`Mesh prep failed: ${res.error ?? "unknown"}`);
+        return ok({
+          ...res,
+          blender,
+          nextStep:
+            "Import the output FBX in OVERDARE Studio: Home > Import > select the file > Import (keep defaults).",
+        });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
+
+  // ======================================================================
   //  EDIT-TIME ENGINE  (.ovdrjm direct edit + level.apply)
   //  Creates persistent instances the RPC can't (instance.upsert is absent).
   //  MUST NOT run during an active playtest (hangs Studio) — stop first.
   // ======================================================================
   let projectFile: string | null = null;
+  let projectOverrideDir: string | null = null;
+
+  // The project currently LOADED in Studio is the source of truth: its screenshot
+  // path is <dir>/Screenshots/Agent/*.png, so we recover the dir from there. This
+  // follows project switches (unlike a pinned env var).
+  async function discoverLoadedProjectDir(): Promise<string | null> {
+    try {
+      const res = (await client.call("game.screenshot", {})) as { path?: string };
+      if (res?.path) return res.path.replace(/[\\/]+Screenshots[\\/].*$/i, "");
+    } catch {
+      /* Studio down or method unavailable — fall through to env */
+    }
+    return null;
+  }
+
   async function getProjectFile(): Promise<string> {
     if (projectFile) return projectFile;
+    // 1) explicit override (overdare_set_project)
+    if (projectOverrideDir) return (projectFile = findProjectFile(projectOverrideDir));
+    // 2) the project actually loaded in Studio — auto-follows project switches
+    const live = await discoverLoadedProjectDir();
+    if (live) return (projectFile = findProjectFile(live));
+    // 3) env fallback
     const envDir = process.env.OVERDARE_PROJECT_DIR;
     if (envDir) return (projectFile = findProjectFile(envDir));
-    // Discover the project dir from a screenshot path: <dir>/Screenshots/Agent/*.png
-    const res = (await client.call("game.screenshot", {})) as { path?: string };
-    if (!res?.path) throw new Error("Could not discover project dir (set OVERDARE_PROJECT_DIR).");
-    const dir = res.path.replace(/[\\/]+Screenshots[\\/].*$/i, "");
-    return (projectFile = findProjectFile(dir));
+    throw new Error(
+      "Could not determine which project is loaded. Open a project in Studio, then call overdare_set_project (or set OVERDARE_PROJECT_DIR).",
+    );
   }
 
   async function applyEdit(mutate: (doc: ReturnType<typeof loadDoc>) => unknown) {
@@ -329,6 +471,38 @@ export function registerTools(server: McpServer, client: StudioRpcClient) {
     const apply = await client.call("level.apply", {});
     return { result, apply };
   }
+
+  server.registerTool(
+    "overdare_set_project",
+    {
+      description:
+        "Point the .ovdrjm file-edit tools at a project, or re-detect the loaded one. By default the server auto-follows whichever project is open in Studio (via its screenshot path); call this after switching projects in Studio, or to force a specific directory. Pass no dir to clear the cache and re-detect the loaded project.",
+      inputSchema: {
+        dir: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to the project directory (the folder containing the .ovdrjm). Omit to clear the cached target and re-detect the currently loaded project.",
+          ),
+      },
+    },
+    async (a: Json) => {
+      try {
+        projectFile = null; // invalidate cache
+        const dir = (a.dir as string | undefined)?.trim();
+        if (dir) {
+          projectOverrideDir = dir;
+          projectFile = findProjectFile(dir);
+          return ok({ mode: "override", projectFile });
+        }
+        projectOverrideDir = null;
+        const file = await getProjectFile(); // re-detects the loaded project
+        return ok({ mode: "auto-detected", projectFile: file });
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
 
   server.registerTool(
     "overdare_create_part",
